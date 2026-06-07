@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>COLD OUTREACH SYSTEM</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0D1117;color:#F9FAFB;font-family:'DM Sans',sans-serif;min-height:100vh}
+  input,textarea,button{font-family:'DM Sans',sans-serif}
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-track{background:#0D1117}
+  ::-webkit-scrollbar-thumb{background:#374151;border-radius:3px}
+  a{color:#60A5FA;text-decoration:none}a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect}=React;
+const MONO="'DM Mono','Fira Code','Courier New',monospace";
+const SANS="'DM Sans','Helvetica Neue',sans-serif";
+
+// ── Storage ───────────────────────────────────────────────────────────────────
+const ls={
+  get:k=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):null;}catch{return null;}},
+  set:(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v));}catch{}}
+};
+
+// ── APIs ──────────────────────────────────────────────────────────────────────
+async function brevoSend(apiKey,from,to,subject,html){
+  const r=await fetch("https://api.brevo.com/v3/smtp/email",{
+    method:"POST",headers:{"api-key":apiKey,"Content-Type":"application/json"},
+    body:JSON.stringify({sender:from,to:[to],subject,htmlContent:html})
+  });
+  if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e.message||`HTTP ${r.status}`);}
+  return r.json();
+}
+
+async function searchPlaces(apiKey,query){
+  const r=await fetch("https://places.googleapis.com/v1/places:searchText",{
+    method:"POST",
+    headers:{"X-Goog-Api-Key":apiKey,"X-Goog-FieldMask":"places.id,places.displayName,places.formattedAddress,places.websiteUri,places.nationalPhoneNumber","Content-Type":"application/json"},
+    body:JSON.stringify({textQuery:query,languageCode:"ja",maxResultCount:20})
+  });
+  if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e.error?.message||`HTTP ${r.status}`);}
+  const d=await r.json();
+  return(d.places||[]).map(p=>({
+    _id:Math.random().toString(36).slice(2,9),
+    name:p.displayName?.text||"",address:p.formattedAddress||"",
+    website:p.websiteUri||"",phone:p.nationalPhoneNumber||"",
+    email:"",emailStatus:"none",igHandle:"",igStatus:"none",selected:false
+  }));
+}
+
+// Gemini 2.0 Flash + Google Search grounding → find Instagram handle
+async function findIG(geminiKey,name,website){
+  const prompt=`「${name}」という日本のクリニックの公式Instagramアカウントのハンドルネームを探してください。\nウェブサイト: ${website||"不明"}\n\nJSON形式のみで返答してください: {"handle":"アカウント名"} または見つからない場合 {"handle":null}\n@マークは不要。説明文は不要。`;
+  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`,{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      contents:[{parts:[{text:prompt}]}],
+      tools:[{googleSearch:{}}],
+      generationConfig:{responseMimeType:"text/plain"}
+    })
+  });
+  if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e.error?.message||`HTTP ${r.status}`);}
+  const d=await r.json();
+  const text=(d.candidates?.[0]?.content?.parts||[]).map(p=>p.text||"").join("");
+  try{
+    const clean=text.replace(/```json|```/g,"").trim();
+    // extract JSON from text
+    const match=clean.match(/\{[^}]+\}/);
+    if(match){const j=JSON.parse(match[0]);return j.handle||null;}
+    return null;
+  }catch{return null;}
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function tmpl(str,vars){
+  if(!str)return"";
+  return str
+    .replace(/\{\{\s*firstName\s*\}\}/g,(vars.company||"").replace(/クリニック|美容|外科|皮膚科|院$/g,"").trim()||vars.company||"")
+    .replace(/\{\{\s*name\s*\}\}/g,vars.name||"")
+    .replace(/\{\{\s*company\s*\}\}/g,vars.company||"")
+    .replace(/\{\{\s*website\s*\}\}/g,vars.website||"");
+}
+function parseCsv(raw){
+  const lines=raw.trim().split("\n").filter(l=>l.trim());
+  if(!lines.length)return[];
+  const first=lines[0].toLowerCase();
+  const hasH=["name","email","company","mail"].some(k=>first.includes(k));
+  const headers=hasH?lines[0].split(",").map(s=>s.trim().toLowerCase().replace(/\s+/g,"")):["name","email","company"];
+  return(hasH?lines.slice(1):lines).map(line=>{
+    const cols=line.split(",").map(s=>s.trim().replace(/^"|"$/g,""));
+    const o={};headers.forEach((h,i)=>{if(cols[i])o[h]=cols[i];});
+    return{id:Math.random().toString(36).slice(2,9),name:o.name||"",email:o.email||o.mail||"",company:o.company||"",website:o.website||"",status:"pending",sentAt:null,fu1At:null,fu2At:null,fu1Due:null,fu2Due:null,error:null};
+  }).filter(l=>l.email&&l.email.includes("@"));
+}
+const fmt=ts=>ts?new Date(ts).toLocaleDateString("ja-JP",{month:"short",day:"numeric"}):"—";
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+async function copy(text){try{await navigator.clipboard.writeText(text);return true;}catch{return false;}}
+
+// ── Defaults ──────────────────────────────────────────────────────────────────
+const DEF_S={apiKey:"",senderEmail:"",senderName:"",placesApiKey:"",geminiKey:""};
+const DEF_C={
+  subject:"",body:"",
+  contactTemplate:"はじめまして。[名前]と申します。\n\n{{company}}様のウェブサイトを拝見し、ご連絡させていただきました。\n\nAIを活用してウェブサイトを自動更新するサービスを提供しております。新しいAIモデルがリリースされるたびに、サイトを自動で作り替えることができます。\n\n5分ほどお時間をいただけますでしょうか？\n\n[名前] / [社名]",
+  dmTemplate:"はじめまして！[名前]と申します🙏\n\n{{company}}様のインスタを拝見し、DMさせていただきました。\n\nAIでウェブサイトを自動更新するサービスを提供しております。新モデルが出るたびにサイトを自動で作り替えられます✨\n\nご興味があればぜひお話しさせてください😊",
+  fu1:{enabled:false,days:3,subject:"",body:""},
+  fu2:{enabled:false,days:7,subject:"",body:""}
+};
+
+// ── UI Parts ──────────────────────────────────────────────────────────────────
+function Tag({status}){
+  const m={pending:["未送信","#6B7280","rgba(107,114,128,0.1)"],sent:["送信済","#059669","rgba(5,150,105,0.1)"],failed:["失敗","#DC2626","rgba(220,38,38,0.1)"]};
+  const[l,c,b]=m[status]||["—","#888","#111"];
+  return React.createElement("span",{style:{fontFamily:MONO,fontSize:10,fontWeight:500,color:c,background:b,border:`1px solid ${c}40`,padding:"2px 7px",borderRadius:3,whiteSpace:"nowrap"}},l);
+}
+function Inp({label,value,onChange,type="text",placeholder,mono,note}){
+  const[focused,setFocused]=useState(false);
+  return React.createElement("div",{style:{marginBottom:12}},
+    label&&React.createElement("div",{style:{fontSize:11,color:"#9CA3AF",marginBottom:5,fontFamily:MONO,letterSpacing:"0.06em",textTransform:"uppercase"}},label),
+    React.createElement("input",{type,value,onChange:e=>onChange(e.target.value),placeholder,
+      style:{width:"100%",padding:"9px 12px",borderRadius:6,fontSize:13,border:`1px solid ${focused?"#4F46E5":"#374151"}`,background:"#111827",color:"#F9FAFB",fontFamily:mono?MONO:SANS,boxSizing:"border-box",outline:"none"},
+      onFocus:()=>setFocused(true),onBlur:()=>setFocused(false)}),
+    note&&React.createElement("div",{style:{fontSize:11,color:"#4B5563",marginTop:4}},note)
+  );
+}
+function TA({label,value,onChange,placeholder,rows=6,hint}){
+  const[focused,setFocused]=useState(false);
+  return React.createElement("div",{style:{marginBottom:12}},
+    label&&React.createElement("div",{style:{fontSize:11,color:"#9CA3AF",marginBottom:5,fontFamily:MONO,letterSpacing:"0.06em",textTransform:"uppercase"}},label),
+    hint&&React.createElement("div",{style:{fontSize:11,color:"#6B7280",marginBottom:6}},hint),
+    React.createElement("textarea",{value,onChange:e=>onChange(e.target.value),placeholder,rows,
+      style:{width:"100%",padding:"9px 12px",borderRadius:6,fontSize:13,border:`1px solid ${focused?"#4F46E5":"#374151"}`,background:"#111827",color:"#F9FAFB",fontFamily:SANS,boxSizing:"border-box",resize:"vertical",lineHeight:1.7,outline:"none"},
+      onFocus:()=>setFocused(true),onBlur:()=>setFocused(false)})
+  );
+}
+function Btn({children,onClick,disabled,v="primary",sm}){
+  const[hov,setHov]=useState(false);
+  const s={primary:{bg:"#4F46E5",col:"#fff"},ghost:{bg:"transparent",col:"#9CA3AF",bdr:"1px solid #374151"},success:{bg:"#059669",col:"#fff"},warn:{bg:"#D97706",col:"#fff"},ig:{bg:"#E1306C",col:"#fff"}}[v]||{bg:"#4F46E5",col:"#fff"};
+  return React.createElement("button",{onClick,disabled,
+    style:{padding:sm?"5px 10px":"9px 18px",borderRadius:6,fontSize:sm?11:13,fontWeight:500,background:disabled?"#1F2937":(hov?s.bg+"cc":s.bg),color:disabled?"#4B5563":s.col,border:disabled?"1px solid #374151":(s.bdr||`1px solid ${s.bg}`),cursor:disabled?"not-allowed":"pointer",whiteSpace:"nowrap",transition:"background 0.15s"},
+    onMouseEnter:()=>setHov(true),onMouseLeave:()=>setHov(false)},children);
+}
+function SC({label,value,accent}){
+  return React.createElement("div",{style:{background:"#111827",border:"1px solid #1F2937",borderRadius:8,padding:"16px 20px",borderTop:`2px solid ${accent||"#374151"}`}},
+    React.createElement("div",{style:{fontSize:28,fontWeight:500,fontFamily:MONO,color:"#F9FAFB"}},value),
+    React.createElement("div",{style:{fontSize:11,color:"#6B7280",marginTop:4,fontFamily:MONO,letterSpacing:"0.05em",textTransform:"uppercase"}},label)
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App(){
+  const[tab,setTab]=useState(0);
+  const[S,setS]=useState(()=>ls.get("cos_s")||DEF_S);
+  const[leads,setLeads]=useState(()=>ls.get("cos_l")||[]);
+  const[C,setC]=useState(()=>ls.get("cos_c")||DEF_C);
+  const[csvText,setCsvText]=useState("");
+  const[sending,setSending]=useState(false);
+  const[prog,setProg]=useState({done:0,total:0});
+  const[toast,setToast]=useState(null);
+  const[q,setQ]=useState("");
+  const[results,setResults]=useState([]);
+  const[searching,setSearching]=useState(false);
+  const[igSearchId,setIgSearchId]=useState(null);
+  const[copiedId,setCopiedId]=useState(null);
+
+  useEffect(()=>{autoFU();},[]);
+
+  const t$=(msg,type="ok")=>{setToast({msg,type});setTimeout(()=>setToast(null),5000);};
+  const updL=v=>{setLeads(v);ls.set("cos_l",v);};
+  const updS=v=>{setS(v);ls.set("cos_s",v);};
+  const updC=v=>{setC(v);ls.set("cos_c",v);};
+  const showCopied=id=>{setCopiedId(id);setTimeout(()=>setCopiedId(null),2000);};
+
+  async function openHP(r){
+    const text=tmpl(C.contactTemplate,{name:r.name,company:r.name,website:r.website});
+    await copy(text);
+    window.open(r.website,"_blank");
+    showCopied(r._id+"hp");
+    t$("✅ テンプレをコピー！サイトを開きました。お問い合わせページで Ctrl+V（Mac: ⌘+V）してください");
+  }
+  async function openDM(r){
+    const text=tmpl(C.dmTemplate,{name:r.name,company:r.name,website:r.website});
+    await copy(text);
+    window.open(`https://ig.me/m/${r.igHandle}`,"_blank");
+    showCopied(r._id+"ig");
+    t$("✅ DMテンプレをコピー！DM画面を開きました。貼り付けて送信してください");
+  }
+
+  async function searchIG(i){
+    if(!S.geminiKey)return t$("設定タブでGemini APIキーを入力してください","err");
+    const r=results[i];
+    setIgSearchId(r._id);
+    setResults(p=>p.map((x,j)=>j===i?{...x,igStatus:"searching"}:x));
+    try{
+      const h=await findIG(S.geminiKey,r.name,r.website);
+      setResults(p=>p.map((x,j)=>j===i?{...x,igHandle:h||"",igStatus:h?"found":"notfound"}:x));
+      if(!h)t$(`${r.name} のIGが見つかりませんでした`,"err");
+    }catch(e){
+      setResults(p=>p.map((x,j)=>j===i?{...x,igStatus:"error"}:x));
+      t$(`IGエラー: ${e.message}`,"err");
+    }
+    setIgSearchId(null);
+  }
+
+  async function searchIGAll(){
+    if(!S.geminiKey)return t$("設定タブでGemini APIキーを入力してください","err");
+    const targets=results.filter(r=>r.selected&&!r.igHandle);
+    if(!targets.length)return t$("選択済みでIG未検索のクリニックがありません","err");
+    for(let i=0;i<results.length;i++){
+      const r=results[i];
+      if(!r.selected||r.igHandle)continue;
+      setIgSearchId(r._id);
+      setResults(p=>p.map((x,j)=>j===i?{...x,igStatus:"searching"}:x));
+      try{
+        const h=await findIG(S.geminiKey,r.name,r.website);
+        setResults(p=>p.map((x,j)=>j===i?{...x,igHandle:h||"",igStatus:h?"found":"notfound"}:x));
+      }catch{
+        setResults(p=>p.map((x,j)=>j===i?{...x,igStatus:"error"}:x));
+      }
+      await sleep(800);
+    }
+    setIgSearchId(null);
+    t$(`${targets.length}件のIG検索完了`);
+  }
+
+  async function doSearch(){
+    if(!S.placesApiKey)return t$("設定タブでGoogle Places APIキーを入力してください","err");
+    if(!q.trim())return;
+    setSearching(true);setResults([]);
+    try{
+      const r=await searchPlaces(S.placesApiKey,q);
+      setResults(r);
+      if(!r.length)t$("結果が見つかりませんでした");
+    }catch(e){t$(`検索エラー: ${e.message}`,"err");}
+    setSearching(false);
+  }
+
+  function addToLeads(){
+    const sel=results.filter(r=>r.selected&&r.email);
+    if(!sel.length)return t$("メール入力済みの選択クリニックがありません","err");
+    const ex=new Set(leads.map(l=>l.email));
+    const add=sel.filter(r=>!ex.has(r.email)).map(r=>({
+      id:Math.random().toString(36).slice(2,9),name:r.name,email:r.email,
+      company:r.name,website:r.website,status:"pending",
+      sentAt:null,fu1At:null,fu2At:null,fu1Due:null,fu2Due:null,error:null
+    }));
+    updL([...leads,...add]);
+    t$(`${add.length}件をメールリストに追加`);
+  }
+
+  function importCsv(){
+    const p=parseCsv(csvText);
+    if(!p.length)return t$("CSVが読み込めませんでした","err");
+    const ex=new Set(leads.map(l=>l.email));
+    const fresh=p.filter(l=>!ex.has(l.email));
+    updL([...leads,...fresh]);setCsvText("");
+    t$(`${fresh.length}件追加（重複${p.length-fresh.length}件スキップ）`);
+  }
+
+  async function sendCampaign(){
+    if(!S.apiKey||!S.senderEmail){t$("⚙️ タブでAPIキーを設定してください","err");setTab(0);return;}
+    if(!C.subject||!C.body){t$("件名と本文を入力してください","err");setTab(3);return;}
+    const targets=leads.filter(l=>l.status==="pending");
+    if(!targets.length)return t$("送信対象がありません","err");
+    setSending(true);let ok=0,fail=0;const now=Date.now();const upd=[...leads];
+    setProg({done:0,total:targets.length});
+    for(const lead of targets){
+      const vars={name:lead.name,company:lead.company,website:lead.website};
+      try{
+        await brevoSend(S.apiKey,{name:S.senderName,email:S.senderEmail},{name:lead.name,email:lead.email},
+          tmpl(C.subject,vars),tmpl(C.body,vars).replace(/\n/g,"<br>"));
+        const i=upd.findIndex(l=>l.id===lead.id);
+        upd[i]={...upd[i],status:"sent",sentAt:now,error:null,
+          fu1Due:C.fu1.enabled?now+C.fu1.days*86400000:null,
+          fu2Due:C.fu2.enabled?now+C.fu2.days*86400000:null};
+        ok++;
+      }catch(e){
+        const i=upd.findIndex(l=>l.id===lead.id);
+        upd[i]={...upd[i],status:"failed",error:e.message};fail++;
+      }
+      setProg({done:ok+fail,total:targets.length});await sleep(400);
+    }
+    updL(upd);setSending(false);
+    t$(`✅ ${ok}件送信完了${fail?`  /  ❌ ${fail}件失敗`:""}`);
+  }
+
+  async function autoFU(){
+    const sData=ls.get("cos_s")||DEF_S;
+    if(!sData.apiKey)return;
+    const lData=ls.get("cos_l")||[];
+    const cData=ls.get("cos_c")||DEF_C;
+    const now=Date.now();
+    const need=lData.filter(l=>(l.fu1Due&&l.fu1Due<=now&&!l.fu1At)||(l.fu2Due&&l.fu2Due<=now&&!l.fu2At));
+    if(!need.length)return;
+    const upd=[...lData];let sent=0;
+    for(const lead of need){
+      const vars={name:lead.name,company:lead.company,website:lead.website};
+      if(lead.fu1Due&&lead.fu1Due<=now&&!lead.fu1At&&cData.fu1.enabled){
+        try{
+          await brevoSend(sData.apiKey,{name:sData.senderName,email:sData.senderEmail},{name:lead.name,email:lead.email},
+            tmpl(cData.fu1.subject||"Re: "+cData.subject,vars),tmpl(cData.fu1.body,vars).replace(/\n/g,"<br>"));
+          const i=upd.findIndex(l=>l.id===lead.id);upd[i]={...upd[i],fu1At:Date.now()};sent++;await sleep(400);
+        }catch{}
+      }
+      if(lead.fu2Due&&lead.fu2Due<=now&&!lead.fu2At&&cData.fu2.enabled){
+        try{
+          await brevoSend(sData.apiKey,{name:sData.senderName,email:sData.senderEmail},{name:lead.name,email:lead.email},
+            tmpl(cData.fu2.subject||"Re: "+cData.subject,vars),tmpl(cData.fu2.body,vars).replace(/\n/g,"<br>"));
+          const i=upd.findIndex(l=>l.id===lead.id);upd[i]={...upd[i],fu2At:Date.now()};sent++;await sleep(400);
+        }catch{}
+      }
+    }
+    if(sent){updL(upd);t$(`フォローアップ ${sent}件を自動送信`);}
+  }
+
+  const stats={
+    total:leads.length,pending:leads.filter(l=>l.status==="pending").length,
+    sent:leads.filter(l=>l.status==="sent").length,failed:leads.filter(l=>l.status==="failed").length,
+    fu1:leads.filter(l=>l.fu1At).length,fu2:leads.filter(l=>l.fu2At).length,
+    fuP:leads.filter(l=>(l.fu1Due&&!l.fu1At)||(l.fu2Due&&!l.fu2At)).length
+  };
+
+  const TABS=["⚙️  設定","🗺️  発掘","🎯  メールリスト","✉️  キャンペーン","📊  結果"];
+
+  // ── Render ──
+  return React.createElement("div",{style:{background:"#0D1117",minHeight:"100vh",paddingBottom:60}},
+
+    // Header
+    React.createElement("div",{style:{borderBottom:"1px solid #1F2937",padding:"18px 24px",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:12}},
+      React.createElement("div",null,
+        React.createElement("div",{style:{fontFamily:MONO,fontSize:13,color:"#4F46E5",letterSpacing:"0.1em"}},"COLD_OUTREACH_SYSTEM"),
+        React.createElement("div",{style:{fontSize:11,color:"#4B5563",fontFamily:MONO,marginTop:2}},"マップ発掘 · HP問い合わせ · Instagram DM · メール自動送信")
+      ),
+      React.createElement("div",{style:{display:"flex",gap:16}},
+        [["送信済",stats.sent,"#059669"],["未送信",stats.pending,"#6B7280"]].map(([l,v,c])=>
+          React.createElement("div",{key:l,style:{fontFamily:MONO,fontSize:12,color:c}},
+            React.createElement("span",{style:{fontSize:18,fontWeight:500}},v)," ",l)
+        )
+      )
+    ),
+
+    // Tabs
+    React.createElement("div",{style:{display:"flex",borderBottom:"1px solid #1F2937",padding:"0 24px",overflowX:"auto"}},
+      TABS.map((t,i)=>React.createElement("button",{key:i,onClick:()=>setTab(i),
+        style:{padding:"12px 14px",background:"none",border:"none",borderBottom:tab===i?"2px solid #4F46E5":"2px solid transparent",color:tab===i?"#F9FAFB":"#4B5563",cursor:"pointer",fontSize:13,marginBottom:-1,whiteSpace:"nowrap"}},t))
+    ),
+
+    toast&&React.createElement("div",{style:{margin:"16px 24px 0",padding:"10px 16px",borderRadius:6,fontSize:13,background:toast.type==="err"?"#1C0A0A":"#071C12",color:toast.type==="err"?"#FCA5A5":"#6EE7B7",border:`1px solid ${toast.type==="err"?"#7F1D1D":"#064E3B"}`,fontFamily:MONO}},toast.msg),
+
+    React.createElement("div",{style:{padding:"24px"}},
+
+      // ── TAB 0: 設定 ──
+      tab===0&&React.createElement("div",{style:{maxWidth:540}},
+        // 設定カード群
+        ...[
+          // Brevo
+          React.createElement("div",{key:"brevo",style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,padding:20,marginBottom:16}},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
+              React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#4F46E5",letterSpacing:"0.08em"}},"① BREVO — メール送信"),
+              React.createElement("a",{href:"https://brevo.com",target:"_blank",style:{fontSize:11,color:"#6B7280"}},"登録 →")
+            ),
+            React.createElement(Inp,{label:"API Key",value:S.apiKey,onChange:v=>updS({...S,apiKey:v}),type:"password",placeholder:"xkeysib-...",mono:true,note:"brevo.com → Settings → API Keys → Create new API key"}),
+            React.createElement(Inp,{label:"送信元メール",value:S.senderEmail,onChange:v=>updS({...S,senderEmail:v}),placeholder:"info@send.yourdomain.com",note:"取得済みのサブドメインのメールアドレス"}),
+            React.createElement(Inp,{label:"送信者名",value:S.senderName,onChange:v=>updS({...S,senderName:v}),placeholder:"田中 / AIO Studio"})
+          ),
+          // Google Places
+          React.createElement("div",{key:"places",style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,padding:20,marginBottom:16}},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
+              React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#10B981",letterSpacing:"0.08em"}},"② GOOGLE PLACES — マップ検索"),
+              React.createElement("a",{href:"https://console.cloud.google.com",target:"_blank",style:{fontSize:11,color:"#6B7280"}},"コンソール →")
+            ),
+            React.createElement(Inp,{label:"Google Places API Key",value:S.placesApiKey,onChange:v=>updS({...S,placesApiKey:v}),type:"password",placeholder:"AIzaSy...",mono:true,note:"Places API (New) を有効化 → APIキー発行 / $200/月無料クレジット付き"})
+          ),
+          // Gemini
+          React.createElement("div",{key:"gemini",style:{background:"#111827",border:"1px solid #1F2937",borderLeft:"3px solid #4285F4",borderRadius:10,padding:20,marginBottom:16}},
+            React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}},
+              React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#4285F4",letterSpacing:"0.08em"}},"③ GEMINI — Instagram検索（完全無料）"),
+              React.createElement("a",{href:"https://aistudio.google.com/apikey",target:"_blank",style:{fontSize:11,color:"#6B7280"}},"取得 →")
+            ),
+            React.createElement(Inp,{label:"Gemini API Key",value:S.geminiKey,onChange:v=>updS({...S,geminiKey:v}),type:"password",placeholder:"AIzaSy...",mono:true,note:"aistudio.google.com → Get API key → Create API key / 1日1,500回無料"}),
+            React.createElement("div",{style:{background:"#0C1A2E",borderRadius:6,padding:10,marginTop:4}},
+              React.createElement("div",{style:{fontSize:12,color:"#93C5FD",lineHeight:1.7}},
+                "Gemini 2.0 Flash + Google検索でクリニックのIGアカウントを自動発見します。",React.createElement("br"),
+                React.createElement("span",{style:{color:"#6EE7B7"}},"Google Cloudと同じアカウントで取得できます。")
+              )
+            )
+          ),
+          // Status
+          React.createElement("div",{key:"status",style:{background:"#0D1117",border:"1px solid #1F2937",borderRadius:10,padding:16}},
+            React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#4B5563",letterSpacing:"0.08em",marginBottom:12}},"設定状態"),
+            React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+              [
+                ["Brevo API Key",!!S.apiKey],
+                ["送信元メール",!!S.senderEmail],
+                ["Google Places API Key",!!S.placesApiKey],
+                ["Gemini API Key",!!S.geminiKey],
+              ].map(([label,ok])=>React.createElement("div",{key:label,style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},
+                React.createElement("span",{style:{fontSize:12,color:"#9CA3AF"}},label),
+                React.createElement("span",{style:{fontSize:11,fontFamily:MONO,color:ok?"#059669":"#4B5563"}},ok?"✓ 設定済み":"未設定")
+              ))
+            )
+          )
+        ]
+      ),
+
+      // ── TAB 1: 発掘 ──
+      tab===1&&React.createElement("div",null,
+        React.createElement("div",{style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,padding:20,marginBottom:16}},
+          React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#10B981",letterSpacing:"0.08em",marginBottom:12}},"GOOGLE MAPS 検索"),
+          React.createElement("div",{style:{display:"flex",gap:8}},
+            React.createElement("input",{value:q,onChange:e=>setQ(e.target.value),onKeyDown:e=>e.key==="Enter"&&doSearch(),
+              placeholder:"例: 美容整形クリニック 東京　/　美容外科 渋谷　/　美容皮膚科 大阪",
+              style:{flex:1,padding:"10px 14px",borderRadius:6,fontSize:14,border:"1px solid #374151",background:"#0D1117",color:"#F9FAFB",outline:"none"}}),
+            React.createElement(Btn,{onClick:doSearch,disabled:searching||!q.trim(),v:"success"},searching?"検索中...":"🔍 検索")
+          )
+        ),
+
+        // 使い方（結果なし時）
+        results.length===0&&!searching&&React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}},
+          [
+            ["🌐 HP問い合わせ","「HPを開く」→ サイトが開く\n文面が自動コピー → 貼り付けるだけ","#4F46E5"],
+            ["📸 Instagram DM","Geminiが自動でIGアカウントを検索\n「DMを開く」→ DM画面＋文面コピー","#E1306C"],
+            ["📧 メール一括送信","メール入力→リストに追加\nキャンペーンタブで一括自動送信","#059669"],
+            ["💾 ブラウザ保存","データはlocalStorageに自動保存\nページを閉じても消えない","#D97706"],
+          ].map(([t,d,c])=>React.createElement("div",{key:t,style:{background:"#111827",border:`1px solid ${c}20`,borderLeft:`3px solid ${c}`,borderRadius:8,padding:14}},
+            React.createElement("div",{style:{fontSize:13,fontWeight:600,marginBottom:6,color:c}},t),
+            React.createElement("div",{style:{fontSize:12,color:"#9CA3AF",lineHeight:1.6,whiteSpace:"pre-line"}},d)
+          ))
+        ),
+
+        // 結果
+        results.length>0&&React.createElement("div",null,
+          React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}},
+            React.createElement("div",{style:{display:"flex",gap:10,alignItems:"center"}},
+              React.createElement("span",{style:{fontFamily:MONO,fontSize:12,color:"#9CA3AF"}},`${results.length}件`),
+              React.createElement("button",{onClick:()=>setResults(r=>r.map(x=>({...x,selected:true}))),style:{fontSize:11,color:"#6B7280",background:"none",border:"none",cursor:"pointer"}},"全選択"),
+              React.createElement("button",{onClick:()=>setResults(r=>r.map(x=>({...x,selected:false}))),style:{fontSize:11,color:"#6B7280",background:"none",border:"none",cursor:"pointer"}},"全解除")
+            ),
+            React.createElement("div",{style:{display:"flex",gap:8,flexWrap:"wrap"}},
+              React.createElement(Btn,{sm:true,v:"ig",onClick:searchIGAll,disabled:!!igSearchId},igSearchId?"IG検索中...":"📸 選択分のIG一括検索"),
+              React.createElement(Btn,{sm:true,v:"primary",onClick:addToLeads},"📧 メールリストに追加")
+            )
+          ),
+          React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:8}},
+            results.map((r,i)=>React.createElement("div",{key:r._id,
+              style:{background:r.selected?"#0F172A":"#111827",border:`1px solid ${r.selected?"#4F46E5":"#1F2937"}`,borderRadius:10,padding:"14px 16px"}},
+              // Info row
+              React.createElement("div",{style:{display:"flex",gap:12,alignItems:"flex-start"}},
+                React.createElement("input",{type:"checkbox",checked:r.selected,
+                  onChange:e=>setResults(p=>p.map((x,j)=>j===i?{...x,selected:e.target.checked}:x)),
+                  style:{marginTop:4,width:14,height:14,accentColor:"#4F46E5",flexShrink:0}}),
+                React.createElement("div",{style:{flex:1,minWidth:0}},
+                  React.createElement("div",{style:{fontSize:15,fontWeight:600,marginBottom:2}},r.name),
+                  React.createElement("div",{style:{fontSize:11,color:"#6B7280",marginBottom:6}},r.address),
+                  React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:8}},
+                    r.phone&&React.createElement("span",{style:{fontSize:11,color:"#9CA3AF",fontFamily:MONO}},r.phone),
+                    r.website&&React.createElement("a",{href:r.website,target:"_blank",style:{fontSize:11,color:"#60A5FA"}},r.website.replace(/^https?:\/\//,"").slice(0,40))
+                  )
+                )
+              ),
+              // Action row
+              React.createElement("div",{style:{marginTop:12,paddingTop:12,borderTop:"1px solid #1F2937",display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}},
+                // HP
+                r.website
+                  ?React.createElement(Btn,{sm:true,v:"primary",onClick:()=>openHP(r)},copiedId===r._id+"hp"?"✅ コピー済！":"🌐 HPを開く＋テンプレコピー")
+                  :React.createElement("span",{style:{fontSize:11,color:"#4B5563",fontFamily:MONO}},"HPなし"),
+
+                // IG
+                React.createElement("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+                  r.igHandle
+                    ?React.createElement("div",{style:{display:"flex",gap:6,alignItems:"center"}},
+                      React.createElement("span",{style:{fontSize:11,color:"#EC4899",fontFamily:MONO}},"@",r.igHandle),
+                      React.createElement(Btn,{sm:true,v:"ig",onClick:()=>openDM(r)},copiedId===r._id+"ig"?"✅ コピー済！":"📸 DMを開く＋テンプレコピー"),
+                      React.createElement("button",{onClick:()=>setResults(p=>p.map((x,j)=>j===i?{...x,igHandle:"",igStatus:"none"}:x)),style:{fontSize:10,color:"#4B5563",background:"none",border:"none",cursor:"pointer"}},"×")
+                    )
+                    :r.igStatus==="searching"
+                      ?React.createElement("span",{style:{fontSize:11,color:"#4285F4",fontFamily:MONO}},"🔍 Gemini検索中...")
+                      :r.igStatus==="notfound"
+                        ?React.createElement("span",{style:{fontSize:11,color:"#4B5563",fontFamily:MONO}},"IGなし")
+                        :React.createElement(Btn,{sm:true,v:"ghost",onClick:()=>searchIG(i),disabled:igSearchId===r._id},igSearchId===r._id?"...":"📸 IG検索"),
+                  !r.igHandle&&r.igStatus!=="searching"&&React.createElement("input",{placeholder:"@なしで手動入力",
+                    onChange:e=>{if(e.target.value)setResults(p=>p.map((x,j)=>j===i?{...x,igHandle:e.target.value.replace("@",""),igStatus:"found"}:x));},
+                    style:{fontSize:11,padding:"3px 8px",borderRadius:4,border:"1px solid #374151",background:"#0D1117",color:"#F9FAFB",fontFamily:MONO,width:130,boxSizing:"border-box"}})
+                ),
+
+                // Email
+                React.createElement("div",{style:{marginLeft:"auto"}},
+                  r.email
+                    ?React.createElement("span",{style:{fontSize:11,color:"#6EE7B7",fontFamily:MONO}},"✓ ",r.email)
+                    :React.createElement("input",{placeholder:"メールを入力",
+                      onChange:e=>setResults(p=>p.map((x,j)=>j===i?{...x,email:e.target.value}:x)),
+                      style:{fontSize:11,padding:"3px 8px",borderRadius:4,border:"1px solid #374151",background:"#0D1117",color:"#F9FAFB",fontFamily:MONO,width:160,boxSizing:"border-box"}})
+                )
+              )
+            ))
+          )
+        )
+      ),
+
+      // ── TAB 2: メールリスト ──
+      tab===2&&React.createElement("div",null,
+        React.createElement("div",{style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,padding:20,marginBottom:16}},
+          React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#4F46E5",letterSpacing:"0.08em",marginBottom:12}},"CSV インポート"),
+          React.createElement("div",{style:{fontSize:12,color:"#6B7280",marginBottom:10,fontFamily:MONO}},"列: ",React.createElement("span",{style:{color:"#A5B4FC"}},"name, email, company")),
+          React.createElement("textarea",{value:csvText,onChange:e=>setCsvText(e.target.value),
+            placeholder:"name,email,company\n田中院長,tanaka@clinic.com,銀座美容クリニック",rows:4,
+            style:{width:"100%",padding:"9px 12px",borderRadius:6,fontSize:12,border:"1px solid #374151",background:"#0D1117",color:"#F9FAFB",fontFamily:MONO,boxSizing:"border-box",resize:"vertical"}}),
+          React.createElement("div",{style:{marginTop:10}},React.createElement(Btn,{onClick:importCsv,disabled:!csvText.trim()},"インポート"))
+        ),
+        React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}},
+          React.createElement("span",{style:{fontFamily:MONO,fontSize:12,color:"#9CA3AF"}},`${leads.length} LEADS`),
+          React.createElement("div",{style:{display:"flex",gap:8}},
+            React.createElement(Btn,{v:"ghost",sm:true,onClick:()=>{if(confirm("未送信を削除？"))updL(leads.filter(l=>l.status!=="pending"));}},"未送信のみ削除"),
+            React.createElement(Btn,{v:"ghost",sm:true,onClick:()=>{if(confirm("全削除？"))updL([]);}},"全削除")
+          )
+        ),
+        leads.length===0
+          ?React.createElement("div",{style:{textAlign:"center",padding:48,color:"#4B5563",fontFamily:MONO,fontSize:13}},"発掘タブでメールを入力 → 「メールリストに追加」")
+          :React.createElement("div",{style:{border:"1px solid #1F2937",borderRadius:8,overflow:"hidden"}},
+            React.createElement("div",{style:{display:"grid",gridTemplateColumns:"80px 1fr 1fr 1fr 32px",padding:"8px 12px",background:"#0D1117",borderBottom:"1px solid #1F2937"}},
+              ["STATUS","名前","メール","クリニック",""].map(h=>React.createElement("div",{key:h,style:{fontFamily:MONO,fontSize:10,color:"#4B5563",letterSpacing:"0.06em"}},h))
+            ),
+            leads.slice(0,200).map((lead,i)=>React.createElement("div",{key:lead.id,
+              style:{display:"grid",gridTemplateColumns:"80px 1fr 1fr 1fr 32px",padding:"9px 12px",alignItems:"center",gap:8,background:i%2===0?"#111827":"#0D1117",borderTop:i>0?"1px solid #1F2937":"none"}},
+              React.createElement(Tag,{status:lead.status}),
+              React.createElement("span",{style:{fontSize:13,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},lead.name||"—"),
+              React.createElement("span",{style:{fontSize:12,color:"#6B7280",fontFamily:MONO,overflow:"hidden",textOverflow:"ellipsis"}},lead.email),
+              React.createElement("span",{style:{fontSize:13,color:"#9CA3AF",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}},lead.company||"—"),
+              React.createElement("button",{onClick:()=>updL(leads.filter(l=>l.id!==lead.id)),style:{background:"none",border:"none",cursor:"pointer",color:"#374151",fontSize:16,padding:0}},"×")
+            )),
+            leads.length>200&&React.createElement("div",{style:{padding:"8px 12px",fontSize:12,color:"#4B5563",fontFamily:MONO,borderTop:"1px solid #1F2937"}},`+ ${leads.length-200} 件`)
+          )
+      ),
+
+      // ── TAB 3: キャンペーン ──
+      tab===3&&React.createElement("div",{style:{maxWidth:680}},
+        React.createElement("div",{style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,padding:20,marginBottom:16}},
+          React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#4F46E5",letterSpacing:"0.08em",marginBottom:8}},"🌐 HP問い合わせフォーム用テンプレ"),
+          React.createElement("div",{style:{fontSize:11,color:"#6B7280",marginBottom:10}},`「HPを開く」ボタンで自動コピーされます`),
+          React.createElement(TA,{value:C.contactTemplate,onChange:v=>updC({...C,contactTemplate:v}),rows:7,hint:"変数: {{name}} {{company}} {{website}}"})
+        ),
+        React.createElement("div",{style:{background:"#111827",border:"1px solid #1F2937",borderLeft:"3px solid #E1306C",borderRadius:10,padding:20,marginBottom:16}},
+          React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#E1306C",letterSpacing:"0.08em",marginBottom:8}},"📸 Instagram DM用テンプレ"),
+          React.createElement("div",{style:{fontSize:11,color:"#6B7280",marginBottom:10}},`「DMを開く」ボタンで自動コピーされます`),
+          React.createElement(TA,{value:C.dmTemplate,onChange:v=>updC({...C,dmTemplate:v}),rows:7,hint:"変数: {{name}} {{company}}"})
+        ),
+        React.createElement("div",{style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,padding:20,marginBottom:16}},
+          React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#059669",letterSpacing:"0.08em",marginBottom:12}},"📧 メール自動送信"),
+          React.createElement("div",{style:{fontSize:11,color:"#6B7280",marginBottom:12,fontFamily:MONO}},"変数: ",
+            React.createElement("span",{style:{color:"#A5B4FC"}},"{{name}}")," ",
+            React.createElement("span",{style:{color:"#A5B4FC"}},"{{company}}")
+          ),
+          React.createElement(Inp,{label:"件名",value:C.subject,onChange:v=>updC({...C,subject:v}),placeholder:"{{company}}様のウェブサイトについてご提案があります"}),
+          React.createElement(TA,{label:"本文",value:C.body,onChange:v=>updC({...C,body:v}),rows:9,
+            placeholder:"{{name}}様\n\nはじめまして。[社名]の[名前]です。\n\n{{company}}様のウェブサイトを拝見し、AI自動更新サービスについてご提案があります。\n\n弊社のAIOサービスでは、新しいAIモデルがリリースされるたびにウェブサイトを自動的に作り替えることができます。\n\n5分だけお時間をいただけますでしょうか？\n\n[名前]"})
+        ),
+        ...[{key:"fu1",label:"フォローアップ 1"},{key:"fu2",label:"フォローアップ 2"}].map(({key,label})=>{
+          const fu=C[key];
+          return React.createElement("div",{key,style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,padding:20,marginBottom:16}},
+            React.createElement("div",{style:{display:"flex",alignItems:"center",gap:12,marginBottom:fu.enabled?16:0}},
+              React.createElement("label",{style:{display:"flex",alignItems:"center",gap:8,cursor:"pointer",flex:1}},
+                React.createElement("input",{type:"checkbox",checked:fu.enabled,onChange:e=>updC({...C,[key]:{...fu,enabled:e.target.checked}}),style:{width:14,height:14,accentColor:"#4F46E5"}}),
+                React.createElement("span",{style:{fontFamily:MONO,fontSize:11,color:fu.enabled?"#A5B4FC":"#4B5563",letterSpacing:"0.08em"}},label.toUpperCase())
+              ),
+              fu.enabled&&React.createElement("div",{style:{display:"flex",alignItems:"center",gap:6}},
+                React.createElement("span",{style:{fontSize:12,color:"#6B7280"}},"送信から"),
+                React.createElement("input",{type:"number",min:1,max:30,value:fu.days,onChange:e=>updC({...C,[key]:{...fu,days:Number(e.target.value)}}),
+                  style:{width:48,padding:"4px 8px",borderRadius:4,fontSize:12,background:"#0D1117",border:"1px solid #374151",color:"#F9FAFB",fontFamily:MONO,textAlign:"center"}}),
+                React.createElement("span",{style:{fontSize:12,color:"#6B7280"}},"日後")
+              )
+            ),
+            fu.enabled&&React.createElement("div",null,
+              React.createElement(Inp,{value:fu.subject,onChange:v=>updC({...C,[key]:{...fu,subject:v}}),placeholder:"Re: {{company}}様へのご連絡"}),
+              React.createElement(TA,{value:fu.body,onChange:v=>updC({...C,[key]:{...fu,body:v}}),rows:5,placeholder:"{{name}}様\n\n先日ご連絡させていただきましたが...\n\n[名前]"})
+            )
+          );
+        }),
+        React.createElement("div",{style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,padding:20}},
+          React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center"}},
+            React.createElement("div",null,
+              React.createElement("div",{style:{fontFamily:MONO,fontSize:11,color:"#059669",letterSpacing:"0.08em",marginBottom:4}},"送信実行"),
+              React.createElement("div",{style:{fontSize:13,color:"#9CA3AF"}},"未送信 ",React.createElement("span",{style:{color:"#F9FAFB",fontWeight:600}},stats.pending)," 件")
+            ),
+            sending
+              ?React.createElement("div",{style:{textAlign:"right"}},
+                React.createElement("div",{style:{fontFamily:MONO,fontSize:12,color:"#6EE7B7",marginBottom:6}},`${prog.done}/${prog.total} 送信中...`),
+                React.createElement("div",{style:{background:"#1F2937",borderRadius:3,height:4,width:200}},
+                  React.createElement("div",{style:{background:"#4F46E5",height:4,borderRadius:3,width:`${prog.total?(prog.done/prog.total*100):0}%`,transition:"width 0.3s"}})
+                )
+              )
+              :React.createElement(Btn,{v:"success",onClick:sendCampaign,disabled:stats.pending===0||!S.apiKey},`🚀 ${stats.pending}件に一括送信`)
+          )
+        )
+      ),
+
+      // ── TAB 4: 結果 ──
+      tab===4&&React.createElement("div",null,
+        React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:20}},
+          React.createElement(SC,{label:"総リード",value:stats.total,accent:"#374151"}),
+          React.createElement(SC,{label:"送信済み",value:stats.sent,accent:"#059669"}),
+          React.createElement(SC,{label:"未送信",value:stats.pending,accent:"#6B7280"}),
+          React.createElement(SC,{label:"失敗",value:stats.failed,accent:"#DC2626"}),
+          React.createElement(SC,{label:"FU1送信済",value:stats.fu1,accent:"#4F46E5"}),
+          React.createElement(SC,{label:"FU2送信済",value:stats.fu2,accent:"#7C3AED"})
+        ),
+        stats.fuP>0&&React.createElement("div",{style:{background:"#1C1709",border:"1px solid #78350F",borderRadius:8,padding:12,marginBottom:16,display:"flex",justifyContent:"space-between",alignItems:"center"}},
+          React.createElement("span",{style:{fontSize:13,color:"#FCD34D",fontFamily:MONO}},`⏰ フォローアップ ${stats.fuP}件が送信待ち`),
+          React.createElement(Btn,{sm:true,onClick:autoFU},"今すぐ送信")
+        ),
+        React.createElement("div",{style:{background:"#111827",border:"1px solid #1F2937",borderRadius:10,overflow:"hidden"}},
+          React.createElement("div",{style:{padding:"12px 16px",borderBottom:"1px solid #1F2937",fontFamily:MONO,fontSize:11,color:"#4B5563",letterSpacing:"0.08em"}},"送信ログ"),
+          leads.filter(l=>l.status!=="pending").length===0
+            ?React.createElement("div",{style:{padding:40,textAlign:"center",color:"#4B5563",fontFamily:MONO,fontSize:12}},"まだ送信履歴がありません")
+            :leads.filter(l=>l.status!=="pending").map((lead,i)=>React.createElement("div",{key:lead.id,
+              style:{display:"flex",alignItems:"center",gap:12,padding:"10px 16px",borderTop:i>0?"1px solid #1F2937":"none",background:i%2===0?"#111827":"#0D1117"}},
+              React.createElement(Tag,{status:lead.status}),
+              React.createElement("div",{style:{flex:1}},
+                React.createElement("div",{style:{fontSize:13}},lead.name," ",React.createElement("span",{style:{color:"#6B7280"}},"· ",lead.company)),
+                React.createElement("div",{style:{fontSize:11,color:"#4B5563",fontFamily:MONO}},lead.email),
+                lead.error&&React.createElement("div",{style:{fontSize:11,color:"#FCA5A5"}},`エラー: ${lead.error}`)
+              ),
+              React.createElement("div",{style:{fontSize:11,color:"#4B5563",fontFamily:MONO,textAlign:"right"}},
+                React.createElement("div",null,fmt(lead.sentAt)),
+                lead.fu1At&&React.createElement("div",{style:{color:"#818CF8"}},`FU1 ${fmt(lead.fu1At)}`),
+                lead.fu2At&&React.createElement("div",{style:{color:"#A78BFA"}},`FU2 ${fmt(lead.fu2At)}`)
+              )
+            ))
+        )
+      )
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
