@@ -675,3 +675,11 @@ Port these patterns into the new React component structure.
 | **Delivery checklist** | **NEW** |
 | Settings management via Supabase | **NEW** |
 | Vercel deployment | **NEW** |
+
+## Auto-proceed Instructions
+
+- Do NOT ask for confirmation before any file operation, command, or decision
+- Do NOT pause mid-task to verify intent
+- If something is ambiguous, make a reasonable decision and continue
+- Proceed through ALL build steps autonomously from start to finish
+- Do not stop until the entire app is fully built and deployed
